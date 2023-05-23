@@ -1,0 +1,42 @@
+#!/bin/bash
+
+declare -A ddd_params
+ddd_cmd="dd"
+
+ddd_main(){
+	while [ ! -z "$1" ]; do
+		local ddd_param="${1%%=*}"
+		case "$ddd_param" in
+			"if")
+				ddd_params[$ddd_param]="${1#$ddd_param=}"
+				;;
+			"of")
+				ddd_params[$ddd_param]="${1#$ddd_param=}"
+				;;
+			"bs")
+				ddd_params[$ddd_param]="${1#$ddd_param=}"
+				;;
+			"count")
+				ddd_params[$ddd_param]="${1#$ddd_param=}"
+				;;
+			"status")
+				ddd_params[$ddd_param]="${1#$ddd_param=}"
+				;;
+			*)
+				echo "$FUNCNAME: unrecognized parameter $ddd_param." >&2
+				exit 1
+				;;
+		esac
+		shift
+	done
+	for ddd_param in "${!ddd_params[@]}"; do
+		if [ -z "${ddd_params[$ddd_param]}" ]; then
+			ddd_cmd+=" $ddd_param"
+		else
+			ddd_cmd+=" $ddd_param=${ddd_params[$ddd_param]}"
+		fi
+	done
+	echo $ddd_cmd
+}
+
+ddd_main "$@"
