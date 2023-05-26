@@ -9,6 +9,7 @@ DD_CNT="count"
 DD_STS="status"
 
 DDD_WRITE_BS_SHIFT=20 #1MiB
+DDD_WRITE_BS=$((1 << $DDD_WRITE_BS_SHIFT))
 
 declare -A ddd_params=(
 	[$DD_BS]=512
@@ -159,12 +160,69 @@ ddd_calculateWriteSize(){
 }
 
 ddd_write(){
-	set -x
+	local ddd_write_blocks=0
+	
 	local write_size=$(ddd_calculateWriteSize)
 	local write_blocks=$((write_size >> $DDD_WRITE_BS_SHIFT))
 	local write_remainder=$((write_size % (1 << $DDD_WRITE_BS_SHIFT)))
+	
+	if [ "$write_blocks" -gt 0 ]; then
+		for block_i in $(seq 0 $(($write_blocks-1))); do
+			cmp -s  <(dd if="${ddd_params[$DD_IF]}" bs=$DDD_WRITE_BS skip=$block_i count=1 status=none) \
+				<(dd if="${ddd_params[$DD_OF]}" bs=$DDD_WRITE_BS skip=$block_i count=1 status=none iflag=nocache) && local ret=$? || local ret=$?
+			case "$ret" in
+				0)
+					:
+					;;
+				1)
+					echo "$FUNCNAME: mismatch at block $block_i" >&2
+					local ddd_write_blocks=$((ddd_write_blocks+1))
+					ddd_writeBlock $block_i
+					;;
+				*)
+					echo "$FUNCNAME: compare error on block $block_i with block size ${DDD_WRITE_BS}B" >&2
+					return 1
+					;;
+			esac
+		done
+	fi
+	
+	if [ "$write_remainder" -gt 0 ]; then
+		local block_i=$write_blocks
+		local byte_offset=$((block_i*$DDD_WRITE_BS))
+		cmp -s -n "$write_remainder" \
+			<(dd if="${ddd_params[$DD_IF]}" bs=$write_remainder skip=${byte_offset}B count=1 status=none) \
+			<(dd if="${ddd_params[$DD_OF]}" bs=$write_remainder skip=${byte_offset}B count=1 status=none iflag=nocache) && local ret=$? || local ret=$?
+		case "$ret" in
+			0)
+				:
+				;;
+			1)
+				echo "$FUNCNAME: correcting mismatch at block $block_i"
+				local ddd_write_blocks=$((ddd_write_blocks+1))
+				ddd_writeBlock "${byte_offset}B" "$write_remainder"
+				;;
+			*)
+				echo "$FUNCNAME: compare error on block $block_i with block size ${DDD_WRITE_BS}B" >&2
+				return 1
+				;;
+		esac
+	fi
 
-	set +x
+	echo "$FUNCNAME: $ddd_write_blocks blocks of ${DDD_WRITE_BS}B written"
+}
+
+ddd_writeBlock(){
+	local write_bs="${2:-$DDD_WRITE_BS}"
+	if ! dd if="${ddd_params[$DD_IF]}" of="${ddd_params[$DD_OF]}" bs="$write_bs" skip="$1" seek="$1" count=1 status=none oflag=sync; then
+		echo "$FUNCNAME: failed at block $1" >&2
+		return 1
+	fi
+	if ! cmp -s -n "$write_bs" <(dd if="${ddd_params[$DD_IF]}" bs="$write_bs" skip="$1" count=1 status=none) \
+				   <(dd if="${ddd_params[$DD_OF]}" bs="$write_bs" skip="$1" count=1 status=none iflag=nocache); then
+		echo "$FUNCNAME: unable to correct mismatch at block $1" >&2
+		return 1
+	fi
 }
 
 ddd_main(){
