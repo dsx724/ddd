@@ -34,6 +34,63 @@ ddd_requiredParams(){
 	fi
 }
 
+ddd_convertB2BS(){
+	local digit="$1"
+	local base=1024
+	local exponent=0
+	while [ "$digit" -ge "$base" ]; do
+		if [ "$((digit % base))" -eq 0 ]; then
+			local digit=$((digit >> 10))
+			local exponent=$((exponent+1))
+		fi
+	done
+	if [ "$exponent" -eq 0 ]; then
+		local base=1000
+		while [ "$digit" -ge "$base" ]; do
+			if [ "$((digit % base))" -eq 0 ]; then
+				local digit=$((digit / $base))
+				local exponent=$((exponent+1))
+			fi
+		done
+	fi
+	case "$exponent" in
+		0)
+			local suffix=
+			;;
+		1)
+			local suffix=K
+			;;
+		2)
+			local suffix=M
+			;;
+		3)
+			local suffix=G
+			;;
+		4)
+			local suffix=T
+			;;
+		5)
+			local suffix=P
+			;;
+		6)
+			local suffix=E
+			;;
+		7)
+			local suffix=Z
+			;;
+		8)
+			local suffix=Y
+			;;
+		*)
+			echo "$FUNCNAME: suffix is not supported" >&2
+			;;
+	esac
+	if [ "$base" -eq 1000 ]; then
+		local suffix="${suffix}B"
+	fi
+	echo -n "$digit$suffix"
+}
+
 ddd_convertBS2B(){
 	#empty bs is prefiltered by main
 	#just a number, return number without leading 0s
@@ -180,7 +237,7 @@ ddd_write(){
 					ddd_writeBlock $block_i
 					;;
 				*)
-					echo "$FUNCNAME: compare error on block $block_i with block size ${DDD_WRITE_BS}B" >&2
+					echo "$FUNCNAME: compare error on block $block_i with block size $(ddd_convertB2BS ${DDD_WRITE_BS})" >&2
 					return 1
 					;;
 			esac
@@ -203,13 +260,13 @@ ddd_write(){
 				ddd_writeBlock "${byte_offset}B" "$write_remainder"
 				;;
 			*)
-				echo "$FUNCNAME: compare error on block $block_i with block size ${DDD_WRITE_BS}B" >&2
+				echo "$FUNCNAME: compare error on block $block_i with block size $(ddd_convertB2BS ${DDD_WRITE_BS})" >&2
 				return 1
 				;;
 		esac
 	fi
 
-	echo "$FUNCNAME: $ddd_write_blocks blocks of ${DDD_WRITE_BS}B written"
+	echo "$FUNCNAME: $ddd_write_blocks blocks of $(ddd_convertB2BS ${DDD_WRITE_BS}) written"
 }
 
 ddd_writeBlock(){
