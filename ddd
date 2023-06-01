@@ -7,6 +7,8 @@ DD_OF="of"
 DD_BS="bs"
 DD_CNT="count"
 DD_STS="status"
+DD_SKIP="skip"
+DD_SEEK="seek"
 
 DDD_WRITE_BS_SHIFT=20 #1MiB
 DDD_WRITE_BS=$((1 << $DDD_WRITE_BS_SHIFT))
@@ -32,6 +34,67 @@ ddd_requiredParams(){
 		echo "$FUNCNAME: $DD_OF parameter missing" >&2
 		return 1
 	fi
+}
+
+ddd_convertMS2N(){
+	#just a number, return number without leading 0s
+	if [ -z "${1//[0-9]}" ]; then
+		echo "${1##0*}"
+		return
+	fi
+
+	local digit=$(echo "$1" | sed "s/[^0-9]*\$//")
+	local suffix=$(echo "$1" | sed "s/^[0-9]*//")
+
+	if [ "$1" != "$digit$suffix" ]; then
+		echo "$FUNCNAME: I/O seek parameter is invalid" >&2
+		return 1
+	fi
+
+	if [ -z "$digit" ]; then
+		local digit=1
+	fi
+
+	if [ -z "$suffix" ]; then
+		echo -n "$digit"
+		return
+	fi
+
+	if [ "${#suffix}" -gt 1 ]; then
+		echo "$FUNCNAME: I/O seek parameter suffix is unsupported" >&2
+		return 1
+	fi
+	local base=1000
+	case "${suffix,,}" in
+		"k")
+			local exponent=1
+			;;
+		"m")
+			local exponent=2
+			;;
+		"g")
+			local exponent=3
+			;;
+		"t")
+			local exponent=4
+			;;
+		"p")
+			local exponent=5
+			;;
+		"e")
+			local exponent=6
+			;;
+		"z")
+			local exponent=7
+			;;
+		"y")
+			local exponent=8
+			;;
+		*)
+			echo "$FUNCNAME: I/O seek parameter suffix is unsupported" >&2
+			return 1
+	esac
+	echo -n "$((digit*(base**exponent)))"
 }
 
 ddd_convertB2BS(){
@@ -98,10 +161,10 @@ ddd_convertBS2B(){
 		echo "${1##0*}"
 		return
 	fi
-	
+
 	local digit=$(echo "$1" | sed "s/[^0-9]*\$//")
 	local suffix=$(echo "$1" | sed "s/^[0-9]*//")
-	
+
 	if [ "$1" != "$digit$suffix" ]; then
 		echo "$FUNCNAME: $DD_BS parameter is invalid" >&2
 		return 1
@@ -190,18 +253,18 @@ ddd_calculateWriteSize(){
 		echo "$FUNCNAME: $DD_IF parameter is not a block device or file" >&2
 		return 1
 	fi
-	
+
 	#if [ -b "${ddd_params[$DD_OF]}" ]; then
 		local output_size=$(blockdev --getsize64 "${ddd_params[$DD_OF]}")
 	#else #TODO add support for non block devices
 	#	:
 	#fi
-	
+
 	if [ "$output_size" -lt "$input_size" ]; then
 		echo "$FUNCNAME: $DD_OF parameter is smaller than $DD_IF parameter" >&2
 		return 1
 	fi
-	
+
 	if [ -z "${ddd_params[$DD_CNT]}" ]; then
 		local write_size=$input_size
 	else
@@ -212,13 +275,13 @@ ddd_calculateWriteSize(){
 			local write_size=$input_size
 		fi
 	fi
-	
+
 	echo -n "$write_size"
 }
 
 ddd_write(){
 	local ddd_write_blocks=0
-	
+
 	local write_size=$(ddd_calculateWriteSize)
 	local write_blocks=$((write_size >> $DDD_WRITE_BS_SHIFT))
 	local write_remainder=$((write_size % (1 << $DDD_WRITE_BS_SHIFT)))
@@ -243,7 +306,7 @@ ddd_write(){
 			esac
 		done
 	fi
-	
+
 	if [ "$write_remainder" -gt 0 ]; then
 		local block_i=$write_blocks
 		local byte_offset=$((block_i*$DDD_WRITE_BS))
@@ -344,6 +407,20 @@ ddd_main(){
 				esac
 				ddd_params[$ddd_param]="$ddd_param_value"
 				;;
+			$DD_SKIP)
+				if [ ! -z "$(echo "${ddd_param_value: -1}" | sed "s/[0-9B]//")" ]; then
+					echo "$FUNCNAME: $ddd_param parameter must be block size multiple or an byte offset" >&2
+					return 1
+				fi
+				ddd_params[$ddd_param]="$ddd_param_value"
+				;;
+			$DD_SEEK)
+				if [ ! -z "$(echo "${ddd_param_value: -1}" | sed "s/[0-9B]//")" ]; then
+					echo "$FUNCNAME: $ddd_param parameter must be block size multiple or an byte offset" >&2
+					return 1
+				fi
+				ddd_params[$ddd_param]="$ddd_param_value"
+				;;
 			*)
 				echo "$FUNCNAME: unrecognized parameter $ddd_param." >&2
 				exit 1
@@ -351,7 +428,7 @@ ddd_main(){
 		esac
 		shift
 	done
-	
+
 	ddd_requiredParams
 
 	for ddd_param in "${!ddd_params[@]}"; do
