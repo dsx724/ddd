@@ -11,6 +11,7 @@ DD_CNT="count"
 DD_STS="status"
 DD_SKIP="skip"
 DD_SEEK="seek"
+DDD_WBS="wbs"
 
 DD_STS_NONE="none"
 DD_STS_NOXFER="noxfer"
@@ -25,9 +26,7 @@ DDD_READ_SIZE="DDD_READ_SIZE"
 DDD_WRITE_BS="DDD_WRITE_BS"
 DDD_WRITE_START="DDD_WRITE_START"
 
-if [ -z "$DDD_WRITE_BS_SHIFT" ]; then
-	DDD_WRITE_BS_SHIFT=20 #1MiB
-fi
+DDD_WRITE_BS_SHIFT=20 #1MiB
 
 declare -A ddd_operands=(
 )
@@ -105,25 +104,14 @@ ddd_checkRead(){
 	fi
 }
 
-ddd_setInternalWriteBS(){
-	if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
-		ddd_internal[DDD_WRITE_BS]=${ddd_operands[$DD_BS]}
-	elif [ ! -z "${ddd_operands[$DD_OBS]}" ]; then
-		ddd_internal[DDD_WRITE_BS]=${ddd_operands[$DD_OBS]}
-	fi
-}
-
 ddd_checkWrite(){
-	ddd_setInternalWriteBS
-	
+	local output_size=-1	
 	#TODO add support for character devices
 	if [ -b "${ddd_operands[$DD_OF]}" ]; then
 		local output_size=$(ddd_system blockdev --getsize64 "${ddd_operands[$DD_OF]}")
-	else
-		return
 	fi
 	
-	local obs=${ddd_internal[$DDD_WRITE_BS]}
+	local obs=${ddd_operands[$DD_OBS]}
 
 	local seek=0
 	if [ ! -z "${ddd_operands[$DD_SEEK]}" ]; then
@@ -131,7 +119,7 @@ ddd_checkWrite(){
 	fi
 	
 	local end=$((seek + ${ddd_internal[$DDD_READ_SIZE]}))
-	if [ "$end" -gt "$output_size" ]; then
+	if [ "$output_size" -ge 0 ] && [ "$end" -gt "$output_size" ]; then
 		echo "$FUNCNAME: write to $end exceeds output size $output_size" >&2
 		return 1
 	fi
@@ -459,6 +447,11 @@ ddd_main(){
 				fi
 				ddd_operands[$operand]="$operand_value"
 				;;
+			$DDD_WBS)
+				#convert block size with suffix to integer
+				echo "$FUNCNAME: overriding internal write block size $(ddd_convertInt2BSS ${ddd_internal[$DDD_WRITE_BS]}) with $operand_value" >&2
+				ddd_internal[$DDD_WRITE_BS]="$(ddd_convertBSS2Int "$operand_value")"
+				;;
 			*)
 				echo "$FUNCNAME: unrecognized operand $operand." >&2
 				exit 1
@@ -478,13 +471,17 @@ ddd_main(){
 			ddd_cmd+=" $operand=${ddd_operands[$operand]}"
 		fi
 	done
-	echo $ddd_cmd
+	echo $ddd_cmd >&2
 
 	ddd_checkRead
 	ddd_checkWrite
 
-	ddd_startWrite
-	ddd_verifyWrite
+	for param in "${!ddd_internal[@]}"; do
+		echo "$param: ${ddd_internal[$param]}" >&2
+	done
+
+	#ddd_startWrite
+	#ddd_verifyWrite
 }
 
 ddd_main "$@"
