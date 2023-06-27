@@ -26,6 +26,12 @@ DDD_READ_START="DDD_READ_START"
 DDD_READ_SIZE="DDD_READ_SIZE"
 DDD_WRITE_BS="DDD_WRITE_BS"
 DDD_WRITE_START="DDD_WRITE_START"
+DDD_WRITE_END="DDD_WRITE_END"
+
+DDD_WRITE_SOFF="DDD_WRITE_SOFF"
+DDD_WRITE_SBLK="DDD_WRITE_SBLK"
+DDD_WRITE_EOFF="DDD_WRITE_EOFF"
+DDD_WRITE_EBLK="DDD_WRITE_EBLK"
 
 DDD_WRITE_BS_SHIFT=20 #1MiB
 
@@ -34,9 +40,6 @@ declare -A ddd_operands=(
 declare -A ddd_internal=(
 	[$DDD_INPUT_BS]=512 #assumed device sector size, does this change?
 	[$DDD_WRITE_BS]=$((1 << $DDD_WRITE_BS_SHIFT))
-	#DDD_INPUT_SIZE
-	#DDD_READ_SIZE
-	#DDD_READ_START
 )
 
 ddd_cmd="dd"
@@ -128,12 +131,19 @@ ddd_checkWrite(){
 	if [ ! -z "${ddd_operands[$DD_SEEK]}" ]; then
 		local seek=$((obs * ${ddd_operands[$DD_SEEK]}))
 	fi
+	ddd_internal[$DDD_WRITE_START]=$seek
 	
 	local end=$((seek + ${ddd_internal[$DDD_READ_SIZE]}))
+	ddd_internal[$DDD_WRITE_END]=$end
+
 	if [ "$output_size" -ge 0 ] && [ "$end" -gt "$output_size" ]; then
 		echo "$FUNCNAME: write to $end exceeds output size $output_size" >&2
 		return 1
 	fi
+	ddd_internal[$DDD_WRITE_SOFF]=$((${ddd_internal[$DDD_WRITE_START]} % ${ddd_internal[$DDD_WRITE_BS]}))
+	ddd_internal[$DDD_WRITE_SBLK]=$((${ddd_internal[$DDD_WRITE_START]} / ${ddd_internal[$DDD_WRITE_BS]}))
+	ddd_internal[$DDD_WRITE_EOFF]=$((${ddd_internal[$DDD_WRITE_END]} % ${ddd_internal[$DDD_WRITE_BS]}))
+	ddd_internal[$DDD_WRITE_EBLK]=$(((${ddd_internal[$DDD_WRITE_END]} - 1) / ${ddd_internal[$DDD_WRITE_BS]}))
 }
 
 # convert int to bs with suffix
@@ -290,8 +300,55 @@ ddd_convertBSS2Int(){
 	echo -n "$((digit*(base**exponent)))"
 }
 
+ddd_writeBlock(){
+	local if=${ddd_operands[$DD_IF]}
+	local of=${ddd_operands[$DD_OF]}
+	local ibs=${ddd_internal[$DDD_INPUT_BS]}
+	if [ $1 -ne "${ddd_internal[$DDD_WRITE_SBLK]}" ] && [ $1 -ne "${ddd_internal[$DDD_WRITE_EBLK]}" ]; then
+		local obs=${ddd_internal[$DDD_WRITE_BS]}
+		local skip=$((${ddd_internal[$DDD_READ_START]}  / ibs))
+		local count=$((obs / ibs))
+		local seek=$1
+	else
+		if [ "${ddd_internal[$DDD_WRITE_SBLK]}" -eq "${ddd_internal[$DDD_WRITE_EBLK]}" ]; then
+			local obs=$((${ddd_internal[$DDD_WRITE_EOFF]} - ${ddd_internal[$DDD_WRITE_SOFF]}))
+			if [ $obs -lt 0 ]; then
+				obs=$((obs + ${ddd_internal[$DDD_WRITE_BS]}))
+			elif [ $obs -eq 0 ]; then
+				obs=${ddd_internal[$DDD_WRITE_BS]}
+			fi
+			local skip=$((${ddd_internal[$DDD_READ_START]}  / ibs))
+			local seek=${ddd_internal[$DDD_WRITE_START]}B
+		elif [ $1 -eq "${ddd_internal[$DDD_WRITE_SBLK]}" ]; then
+			local obs=$((${ddd_internal[$DDD_WRITE_BS]} - ${ddd_internal[$DDD_WRITE_SOFF]}))
+			local skip=$((${ddd_internal[$DDD_READ_START]}  / ibs))
+			local seek=${ddd_internal[$DDD_WRITE_START]}B
+		elif [ $1 -eq "${ddd_internal[$DDD_WRITE_EBLK]}" ]; then
+			local obs=${ddd_internal[$DDD_WRITE_EOFF]}
+			if [ $obs -eq 0 ]; then
+				obs=${ddd_internal[$DDD_WRITE_BS]}
+			fi
+			local skip=$((${ddd_internal[$DDD_READ_START]} +  ${ddd_internal[$DDD_READ_SIZE]} - $obs))B
+			local seek=$((${ddd_internal[$DDD_WRITE_START]} + ${ddd_internal[$DDD_READ_SIZE]} - $obs))B
+		fi
+		local count=$((obs / ibs))
+	fi
+	if ! dd if="$if" ibs=$ibs skip=$skip count=$count of="$of" obs=$obs seek=$seek status=none oflag=sync; then
+		echo "$FUNCNAME: failed write at write block $i" >&2
+		return 1
+	fi
+	if ! cmp -s -n $obs	<(dd if="$if" ibs=$ibs skip=$skip count=$count status=none) \
+				<(dd if="$of" ibs=$obs skip=$seek count=1 status=none iflag=nocache); then
+		echo "$FUNCNAME: mismatch at write block $1" >&2
+		return 1
+	fi
+}
+
 ddd_startWrite(){
-	
+	for i in $(seq ${ddd_internal[$DDD_WRITE_SBLK]} ${ddd_internal[$DDD_WRITE_EBLK]}); do
+		ddd_writeBlock $i
+	done
+	return
 	local ddd_write_blocks=0
 
 	local write_size=${ddd_interal[$DDD_READ_SIZE]}
@@ -342,19 +399,6 @@ ddd_startWrite(){
 	fi
 
 	echo "$FUNCNAME: $ddd_write_blocks blocks of $(ddd_convertInt2BSS ${DDD_WRITE_BS}) written"
-}
-
-ddd_writeBlock(){
-	local write_bs="${2:-$DDD_WRITE_BS}"
-	if ! dd if="${ddd_operands[$DD_IF]}" of="${ddd_operands[$DD_OF]}" bs="$write_bs" skip="$1" seek="$1" count=1 status=none oflag=sync; then
-		echo "$FUNCNAME: failed at block $1" >&2
-		return 1
-	fi
-	if ! cmp -s -n "$write_bs" <(dd if="${ddd_operands[$DD_IF]}" bs="$write_bs" skip="$1" count=1 status=none) \
-				   <(dd if="${ddd_operands[$DD_OF]}" bs="$write_bs" skip="$1" count=1 status=none iflag=nocache); then
-		echo "$FUNCNAME: unable to correct mismatch at block $1" >&2
-		return 1
-	fi
 }
 
 ddd_debug(){
@@ -500,7 +544,7 @@ ddd_main(){
 		echo "$param: ${ddd_internal[$param]}" >&2
 	done
 
-	#ddd_startWrite
+	ddd_startWrite
 	#ddd_verifyWrite
 }
 
