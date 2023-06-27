@@ -20,7 +20,8 @@ DD_STS_PROGRESS="progress"
 DDD_INPUT_SIZE="DDD_INPUT_SIZE"
 DDD_OUTPUT_SIZE="DDD_OUTPUT_SIZE"
 
-DDD_READ_BS="DDD_READ_BS"
+DDD_INPUT_BS="DDD_INPUT_BS"
+DDD_OUTPUT_BS="DDD_OUTPUT_BS"
 DDD_READ_START="DDD_READ_START"
 DDD_READ_SIZE="DDD_READ_SIZE"
 DDD_WRITE_BS="DDD_WRITE_BS"
@@ -31,7 +32,7 @@ DDD_WRITE_BS_SHIFT=20 #1MiB
 declare -A ddd_operands=(
 )
 declare -A ddd_internal=(
-	[$DDD_READ_BS]=512 #assumed device sector size, does this change?
+	[$DDD_INPUT_BS]=512 #assumed device sector size, does this change?
 	[$DDD_WRITE_BS]=$((1 << $DDD_WRITE_BS_SHIFT))
 	#DDD_INPUT_SIZE
 	#DDD_READ_SIZE
@@ -59,16 +60,16 @@ ddd_checkOperands(){
 	fi
 }
 
-ddd_setInternalReadBS(){
+ddd_setInternalInputBS(){
 	if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
-		ddd_internal[$DDD_READ_BS]=${ddd_operands[$DD_BS]}
+		ddd_internal[$DDD_INPUT_BS]=${ddd_operands[$DD_BS]}
 	elif [ ! -z "${ddd_operands[$DD_IBS]}" ]; then
-		ddd_internal[$DDD_READ_BS]=${ddd_operands[$DD_IBS]}
+		ddd_internal[$DDD_INPUT_BS]=${ddd_operands[$DD_IBS]}
 	fi
 }
 
 ddd_checkRead(){
-	ddd_setInternalReadBS
+	ddd_setInternalInputBS
 	
 	if [ -b "${ddd_operands[$DD_IF]}" ]; then
 		local input_size=$(ddd_system blockdev --getsize64 "${ddd_operands[$DD_IF]}")
@@ -80,7 +81,7 @@ ddd_checkRead(){
 	fi
 	ddd_internal[$DDD_INPUT_SIZE]=$input_size
 
-	local ibs=${ddd_internal[$DDD_READ_BS]}
+	local ibs=${ddd_internal[$DDD_INPUT_BS]}
 
 	local skip=0
 	if [ ! -z "${ddd_operands[$DD_SKIP]}" ]; then
@@ -104,14 +105,24 @@ ddd_checkRead(){
 	fi
 }
 
+ddd_setInternalOutputBS(){
+	if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
+		ddd_internal[$DDD_OUTPUT_BS]=${ddd_operands[$DD_BS]}
+	elif [ ! -z "${ddd_operands[$DD_OBS]}" ]; then
+		ddd_internal[$DDD_OUTPUT_BS]=${ddd_operands[$DD_OBS]}
+	fi
+}
+
 ddd_checkWrite(){
+	ddd_setInternalOutputBS
+
 	local output_size=-1	
 	#TODO add support for character devices
 	if [ -b "${ddd_operands[$DD_OF]}" ]; then
 		local output_size=$(ddd_system blockdev --getsize64 "${ddd_operands[$DD_OF]}")
 	fi
 	
-	local obs=${ddd_operands[$DD_OBS]}
+	local obs=${ddd_internal[$DDD_OUTPUT_BS]}
 
 	local seek=0
 	if [ ! -z "${ddd_operands[$DD_SEEK]}" ]; then
@@ -393,13 +404,22 @@ ddd_main(){
 				#convert block size with suffix to integer
 				ddd_operands[$operand]="$(ddd_convertBSS2Int "$operand_value")"
 				;;
-			$DD_IBS|$DD_OBS)
+			$DD_IBS)
 				if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
 					echo "$FUNCNAME: $DD_BS operand priority over $operand" >&2
-				else
-					#convert block size with suffix to integer
-					ddd_operands[$operand]="$(ddd_convertBSS2Int "$operand_value")"
 				fi
+				echo "$FUNCNAME: $operand applies to skip only" >&2
+				#convert block size with suffix to integer
+				ddd_operands[$operand]="$(ddd_convertBSS2Int "$operand_value")"
+				
+				;;
+			$DD_OBS)
+				if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
+					echo "$FUNCNAME: $DD_BS operand priority over $operand" >&2
+				fi
+				echo "$FUNCNAME: $operand applies to seek only, new wbs operand determines write block size" >&2
+				#convert block size with suffix to integer
+				ddd_operands[$operand]="$(ddd_convertBSS2Int "$operand_value")"
 				;;
 			$DD_CNT)
 				if [ ! -z "${operand_value//[0-9]}" ]; then
@@ -449,7 +469,7 @@ ddd_main(){
 				;;
 			$DDD_WBS)
 				#convert block size with suffix to integer
-				echo "$FUNCNAME: overriding internal write block size $(ddd_convertInt2BSS ${ddd_internal[$DDD_WRITE_BS]}) with $operand_value" >&2
+				echo "$FUNCNAME: overriding write block size $(ddd_convertInt2BSS ${ddd_internal[$DDD_WRITE_BS]}) with $operand_value" >&2
 				ddd_internal[$DDD_WRITE_BS]="$(ddd_convertBSS2Int "$operand_value")"
 				;;
 			*)
@@ -465,7 +485,7 @@ ddd_main(){
 	for operand in "${!ddd_operands[@]}"; do
 		if [ -z "${ddd_operands[$operand]}" ]; then
 			ddd_cmd+=" $operand"
-		elif [ "$operand" = $DD_BS ] || [ "$operand" = $DD_IBS ] || [ "$operand" = $DD_OBS ] ; then
+		elif [ "$operand" = $DD_BS ] || [ "$operand" = $DD_IBS ] || [ "$operand" = $DD_OBS ]; then
 			ddd_cmd+=" $operand=$(ddd_convertInt2BSS ${ddd_operands[$operand]})"
 		else
 			ddd_cmd+=" $operand=${ddd_operands[$operand]}"
