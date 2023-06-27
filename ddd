@@ -4,100 +4,141 @@ set -e
 
 DD_IF="if"
 DD_OF="of"
-DD_BS="bs"
+DD_BS="bs" #takes precedence over ibs/obs
+DD_IBS="ibs"
+DD_OBS="obs"
 DD_CNT="count"
 DD_STS="status"
 DD_SKIP="skip"
 DD_SEEK="seek"
 
-DDD_WRITE_BS_SHIFT=20 #1MiB
-DDD_WRITE_BS=$((1 << $DDD_WRITE_BS_SHIFT))
+DD_STS_NONE="none"
+DD_STS_NOXFER="noxfer"
+DD_STS_PROGRESS="progress"
 
-declare -A ddd_params=(
-	[$DD_BS]=512
+DDD_INPUT_SIZE="DDD_INPUT_SIZE"
+DDD_OUTPUT_SIZE="DDD_OUTPUT_SIZE"
+
+DDD_READ_BS="DDD_READ_BS"
+DDD_READ_START="DDD_READ_START"
+DDD_READ_SIZE="DDD_READ_SIZE"
+DDD_WRITE_BS="DDD_WRITE_BS"
+DDD_WRITE_START="DDD_WRITE_START"
+
+if [ -z "$DDD_WRITE_BS_SHIFT" ]; then
+	DDD_WRITE_BS_SHIFT=20 #1MiB
+fi
+
+declare -A ddd_operands=(
 )
+declare -A ddd_internal=(
+	[$DDD_READ_BS]=512 #assumed device sector size, does this change?
+	[$DDD_WRITE_BS]=$((1 << $DDD_WRITE_BS_SHIFT))
+	#DDD_INPUT_SIZE
+	#DDD_READ_SIZE
+	#DDD_READ_START
+)
+
 ddd_cmd="dd"
 
-ddd_checkPreReqs(){
-	if ! which blockdev > /dev/null; then
-		echo "$FUNCNAME: ddd requires blockdev" >&2
+ddd_system(){
+	if ! which "$1" > /dev/null; then
+		echo "$FUNCNAME: required executable $1 missing" >&2
+		return 1
+	fi
+	"$@"
+}
+
+ddd_checkOperands(){
+	if [ -z "${ddd_operands[$DD_IF]}" ]; then
+		echo "$FUNCNAME: required $DD_IF operand missing" >&2
+		return 1
+	fi
+	if [ -z "${ddd_operands[$DD_OF]}" ]; then
+		echo "$FUNCNAME: required $DD_OF operand missing" >&2
 		return 1
 	fi
 }
 
-ddd_requiredParams(){
-	if [ -z "${ddd_params[$DD_IF]}" ]; then
-		echo "$FUNCNAME: $DD_IF parameter missing" >&2
+ddd_setInternalReadBS(){
+	if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
+		ddd_internal[$DDD_READ_BS]=${ddd_operands[$DD_BS]}
+	elif [ ! -z "${ddd_operands[$DD_IBS]}" ]; then
+		ddd_internal[$DDD_READ_BS]=${ddd_operands[$DD_IBS]}
+	fi
+}
+
+ddd_checkRead(){
+	ddd_setInternalReadBS
+	
+	if [ -b "${ddd_operands[$DD_IF]}" ]; then
+		local input_size=$(ddd_system blockdev --getsize64 "${ddd_operands[$DD_IF]}")
+	elif [ -f "${ddd_operands[$DD_IF]}" ]; then
+		local input_size=$(stat -c %s "${ddd_operands[$DD_IF]}")
+	else #TODO: add check for character devices
+		echo "$FUNCNAME: $DD_IF operand is not a block device or file" >&2
 		return 1
 	fi
-	if [ -z "${ddd_params[$DD_OF]}" ]; then
-		echo "$FUNCNAME: $DD_OF parameter missing" >&2
+	ddd_internal[$DDD_INPUT_SIZE]=$input_size
+
+	local ibs=${ddd_internal[$DDD_READ_BS]}
+
+	local skip=0
+	if [ ! -z "${ddd_operands[$DD_SKIP]}" ]; then
+		local skip=$((ibs * ${ddd_operands[$DD_SKIP]}))
+	fi
+	ddd_internal[$DDD_READ_START]=$skip
+
+	local count=0
+	if [ ! -z "${ddd_operands[$DD_CNT]}" ]; then
+		local count=${ddd_operands[$DD_CNT]}
+		local size=$((ibs * count))
+	else
+		local size=$((input_size - $skip))
+	fi
+	ddd_internal[$DDD_READ_SIZE]=$size
+
+	local end=$((size + skip))
+	if [ "$end" -gt "$input_size" ]; then
+		echo "$FUNCNAME: read to $end exceeds input size $input_size" >&2
 		return 1
 	fi
 }
 
-ddd_convertMS2N(){
-	#just a number, return number without leading 0s
-	if [ -z "${1//[0-9]}" ]; then
-		echo "${1##0*}"
+ddd_setInternalWriteBS(){
+	if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
+		ddd_internal[DDD_WRITE_BS]=${ddd_operands[$DD_BS]}
+	elif [ ! -z "${ddd_operands[$DD_OBS]}" ]; then
+		ddd_internal[DDD_WRITE_BS]=${ddd_operands[$DD_OBS]}
+	fi
+}
+
+ddd_checkWrite(){
+	ddd_setInternalWriteBS
+	
+	#TODO add support for character devices
+	if [ -b "${ddd_operands[$DD_OF]}" ]; then
+		local output_size=$(ddd_system blockdev --getsize64 "${ddd_operands[$DD_OF]}")
+	else
 		return
 	fi
+	
+	local obs=${ddd_internal[$DDD_WRITE_BS]}
 
-	local digit=$(echo "$1" | sed "s/[^0-9]*\$//")
-	local suffix=$(echo "$1" | sed "s/^[0-9]*//")
-
-	if [ "$1" != "$digit$suffix" ]; then
-		echo "$FUNCNAME: I/O seek parameter is invalid" >&2
+	local seek=0
+	if [ ! -z "${ddd_operands[$DD_SEEK]}" ]; then
+		local seek=$((obs * ${ddd_operands[$DD_SEEK]}))
+	fi
+	
+	local end=$((seek + ${ddd_internal[$DDD_READ_SIZE]}))
+	if [ "$end" -gt "$output_size" ]; then
+		echo "$FUNCNAME: write to $end exceeds output size $output_size" >&2
 		return 1
 	fi
-
-	if [ -z "$digit" ]; then
-		local digit=1
-	fi
-
-	if [ -z "$suffix" ]; then
-		echo -n "$digit"
-		return
-	fi
-
-	if [ "${#suffix}" -gt 1 ]; then
-		echo "$FUNCNAME: I/O seek parameter suffix is unsupported" >&2
-		return 1
-	fi
-	local base=1000
-	case "${suffix,,}" in
-		"k")
-			local exponent=1
-			;;
-		"m")
-			local exponent=2
-			;;
-		"g")
-			local exponent=3
-			;;
-		"t")
-			local exponent=4
-			;;
-		"p")
-			local exponent=5
-			;;
-		"e")
-			local exponent=6
-			;;
-		"z")
-			local exponent=7
-			;;
-		"y")
-			local exponent=8
-			;;
-		*)
-			echo "$FUNCNAME: I/O seek parameter suffix is unsupported" >&2
-			return 1
-	esac
-	echo -n "$((digit*(base**exponent)))"
 }
 
-ddd_convertB2BS(){
+# convert int to bs with suffix
+ddd_convertInt2BSS(){
 	local digit="$1"
 	local base=1024
 	local exponent=0
@@ -105,14 +146,18 @@ ddd_convertB2BS(){
 		if [ "$((digit % base))" -eq 0 ]; then
 			local digit=$((digit >> 10))
 			local exponent=$((exponent+1))
+		else
+			break
 		fi
 	done
 	if [ "$exponent" -eq 0 ]; then
 		local base=1000
 		while [ "$digit" -ge "$base" ]; do
 			if [ "$((digit % base))" -eq 0 ]; then
-				local digit=$((digit / $base))
+				local digit=$((digit / base))
 				local exponent=$((exponent+1))
+			else
+				break
 			fi
 		done
 	fi
@@ -146,15 +191,17 @@ ddd_convertB2BS(){
 			;;
 		*)
 			echo "$FUNCNAME: suffix is not supported" >&2
+			return 1
 			;;
 	esac
-	if [ "$base" -eq 1000 ]; then
+	if [ "$base" -eq 1000 ] && [ "$exponent" -gt 0 ]; then
 		local suffix="${suffix}B"
 	fi
 	echo -n "$digit$suffix"
 }
 
-ddd_convertBS2B(){
+# convert bs with suffix to integer
+ddd_convertBSS2Int(){
 	#empty bs is prefiltered by main
 	#just a number, return number without leading 0s
 	if [ -z "${1//[0-9]}" ]; then
@@ -166,7 +213,7 @@ ddd_convertBS2B(){
 	local suffix=$(echo "$1" | sed "s/^[0-9]*//")
 
 	if [ "$1" != "$digit$suffix" ]; then
-		echo "$FUNCNAME: $DD_BS parameter is invalid" >&2
+		echo "$FUNCNAME: $DD_BS operand is invalid" >&2
 		return 1
 	fi
 
@@ -180,7 +227,7 @@ ddd_convertBS2B(){
 	fi
 
 	if [ "${#suffix}" -gt 3 ]; then
-		echo "$FUNCNAME: $DD_BS parameter suffix is unsupported" >&2
+		echo "$FUNCNAME: $DD_BS operand suffix is unsupported" >&2
 		return 1
 	fi
 	local base=1
@@ -199,13 +246,13 @@ ddd_convertBS2B(){
 			local base=1024
 			if [ "${#suffix}" = 2 ]; then
 				if [ "${suffix:1:1}" != "B" ]; then
-					echo "$FUNCNAME: $DD_BS parameter suffix is unsupported" >&2
+					echo "$FUNCNAME: $DD_BS operand suffix is unsupported" >&2
 					return 1
 				fi
 				local base=1000
 			elif [ "${#suffix}" = 3 ]; then
 				if [ "${suffix:1:2}" != "iB" ]; then
-					echo "$FUNCNAME: $DD_BS parameter suffix is unsupported" >&2
+					echo "$FUNCNAME: $DD_BS operand suffix is unsupported" >&2
 					return 1
 				fi
 			fi
@@ -236,7 +283,7 @@ ddd_convertBS2B(){
 					local exponent=8
 					;;
 				*)
-					echo "$FUNCNAME: $DD_BS parameter suffix is unsupported" >&2
+					echo "$FUNCNAME: $DD_BS operand suffix is unsupported" >&2
 					return 1
 			esac
 			;;
@@ -244,52 +291,18 @@ ddd_convertBS2B(){
 	echo -n "$((digit*(base**exponent)))"
 }
 
-ddd_calculateWriteSize(){
-	if [ -b "${ddd_params[$DD_IF]}" ]; then
-		local input_size=$(blockdev --getsize64 "${ddd_params[$DD_IF]}")
-	elif [ -f "${ddd_params[$DD_IF]}" ]; then
-		local input_size=$(stat -c %s "${ddd_params[$DD_IF]}")
-	else #TODO: add check for character devices
-		echo "$FUNCNAME: $DD_IF parameter is not a block device or file" >&2
-		return 1
-	fi
-
-	#if [ -b "${ddd_params[$DD_OF]}" ]; then
-		local output_size=$(blockdev --getsize64 "${ddd_params[$DD_OF]}")
-	#else #TODO add support for non block devices
-	#	:
-	#fi
-
-	if [ "$output_size" -lt "$input_size" ]; then
-		echo "$FUNCNAME: $DD_OF parameter is smaller than $DD_IF parameter" >&2
-		return 1
-	fi
-
-	if [ -z "${ddd_params[$DD_CNT]}" ]; then
-		local write_size=$input_size
-	else
-		#write size = bs * count
-		local write_size=$((${ddd_params[$DD_BS]}*${ddd_params[$DD_CNT]}))
-		if [ "$write_size" -gt "$input_size" ]; then
-			echo "$FUNCNAME: $DD_IF parameter is smaller than $DD_BS * $DD_CNT" >&2
-			local write_size=$input_size
-		fi
-	fi
-
-	echo -n "$write_size"
-}
-
-ddd_write(){
+ddd_startWrite(){
+	
 	local ddd_write_blocks=0
 
-	local write_size=$(ddd_calculateWriteSize)
+	local write_size=${ddd_interal[$DDD_READ_SIZE]}
 	local write_blocks=$((write_size >> $DDD_WRITE_BS_SHIFT))
 	local write_remainder=$((write_size % (1 << $DDD_WRITE_BS_SHIFT)))
 	
 	if [ "$write_blocks" -gt 0 ]; then
 		for block_i in $(seq 0 $(($write_blocks-1))); do
-			cmp -s  <(dd if="${ddd_params[$DD_IF]}" bs=$DDD_WRITE_BS skip=$block_i count=1 status=none) \
-				<(dd if="${ddd_params[$DD_OF]}" bs=$DDD_WRITE_BS skip=$block_i count=1 status=none iflag=nocache) && local ret=$? || local ret=$?
+			cmp -s  <(dd if="${ddd_operands[$DD_IF]}" bs=$DDD_WRITE_BS skip=$block_i count=1 status=none) \
+				<(dd if="${ddd_operands[$DD_OF]}" bs=$DDD_WRITE_BS skip=$block_i count=1 status=none iflag=nocache) && local ret=$? || local ret=$?
 			case "$ret" in
 				0)
 					:
@@ -300,7 +313,7 @@ ddd_write(){
 					ddd_writeBlock $block_i
 					;;
 				*)
-					echo "$FUNCNAME: compare error on block $block_i with block size $(ddd_convertB2BS ${DDD_WRITE_BS})" >&2
+					echo "$FUNCNAME: compare error on block $block_i with block size $(ddd_convertInt2BSS ${DDD_WRITE_BS})" >&2
 					return 1
 					;;
 			esac
@@ -311,8 +324,8 @@ ddd_write(){
 		local block_i=$write_blocks
 		local byte_offset=$((block_i*$DDD_WRITE_BS))
 		cmp -s -n "$write_remainder" \
-			<(dd if="${ddd_params[$DD_IF]}" bs=$write_remainder skip=${byte_offset}B count=1 status=none) \
-			<(dd if="${ddd_params[$DD_OF]}" bs=$write_remainder skip=${byte_offset}B count=1 status=none iflag=nocache) && local ret=$? || local ret=$?
+			<(dd if="${ddd_operands[$DD_IF]}" bs=$write_remainder skip=${byte_offset}B count=1 status=none) \
+			<(dd if="${ddd_operands[$DD_OF]}" bs=$write_remainder skip=${byte_offset}B count=1 status=none iflag=nocache) && local ret=$? || local ret=$?
 		case "$ret" in
 			0)
 				:
@@ -323,124 +336,155 @@ ddd_write(){
 				ddd_writeBlock "${byte_offset}B" "$write_remainder"
 				;;
 			*)
-				echo "$FUNCNAME: compare error on block $block_i with block size $(ddd_convertB2BS ${DDD_WRITE_BS})" >&2
+				echo "$FUNCNAME: compare error on block $block_i with block size $(ddd_convertInt2BSS ${DDD_WRITE_BS})" >&2
 				return 1
 				;;
 		esac
 	fi
 
-	echo "$FUNCNAME: $ddd_write_blocks blocks of $(ddd_convertB2BS ${DDD_WRITE_BS}) written"
+	echo "$FUNCNAME: $ddd_write_blocks blocks of $(ddd_convertInt2BSS ${DDD_WRITE_BS}) written"
 }
 
 ddd_writeBlock(){
 	local write_bs="${2:-$DDD_WRITE_BS}"
-	if ! dd if="${ddd_params[$DD_IF]}" of="${ddd_params[$DD_OF]}" bs="$write_bs" skip="$1" seek="$1" count=1 status=none oflag=sync; then
+	if ! dd if="${ddd_operands[$DD_IF]}" of="${ddd_operands[$DD_OF]}" bs="$write_bs" skip="$1" seek="$1" count=1 status=none oflag=sync; then
 		echo "$FUNCNAME: failed at block $1" >&2
 		return 1
 	fi
-	if ! cmp -s -n "$write_bs" <(dd if="${ddd_params[$DD_IF]}" bs="$write_bs" skip="$1" count=1 status=none) \
-				   <(dd if="${ddd_params[$DD_OF]}" bs="$write_bs" skip="$1" count=1 status=none iflag=nocache); then
+	if ! cmp -s -n "$write_bs" <(dd if="${ddd_operands[$DD_IF]}" bs="$write_bs" skip="$1" count=1 status=none) \
+				   <(dd if="${ddd_operands[$DD_OF]}" bs="$write_bs" skip="$1" count=1 status=none iflag=nocache); then
 		echo "$FUNCNAME: unable to correct mismatch at block $1" >&2
 		return 1
 	fi
 }
 
+ddd_debug(){
+	if [ ! -z "$DDD_DEBUG" ]; then
+		echo "$FUNCNAME: $@" >&2
+	fi
+}
+
 ddd_main(){
-
-	ddd_checkPreReqs
-
 	while [ ! -z "$1" ]; do
-		local ddd_param="${1%%=*}"
-		local ddd_param_value=${1#$ddd_param=}
-		case "$ddd_param" in
+		local operand="${1%%=*}"
+		local operand_value=${1#$operand=}
+		ddd_debug "$FUNCNAME" "$operand" "$operand_value"
+		case "$operand" in
 			$DD_IF)
-				if [ ! -e "$ddd_param_value" ]; then
-					echo "$FUNCNAME: $ddd_param parameter value does not exist" >&2
+				if [ ! -e "$operand_value" ]; then
+					echo "$FUNCNAME: $operand operand value does not exist" >&2
 					return 1
 				fi
-				if [ ! -r "$ddd_param_value" ]; then
-					echo "$FUNCNAME: $ddd_param parameter value is not readable" >&2
+				if [ ! -r "$operand_value" ]; then
+					echo "$FUNCNAME: $operand operand value is not readable" >&2
 					return 1
 				fi
-				ddd_params[$ddd_param]="$ddd_param_value"
+				ddd_operands[$operand]="$operand_value"
 				;;
 			$DD_OF)
-				if [ ! -e "$ddd_param_value" ]; then
-					echo "$FUNCNAME: $ddd_param parameter value does not exist" >&2
+				if [ ! -e "$operand_value" ]; then
+					if [ ! -w "$(dirname "$operand_value")" ]; then
+						echo "$FUNCNAME: $operand operand directory is not writable" >&2
+						return 1
+					fi
+				elif [ ! -w "$operand_value" ]; then
+					echo "$FUNCNAME: $operand operand value is not writable" >&2
 					return 1
 				fi
-				if [ ! -b "$ddd_param_value" ]; then
-					echo "$FUNCNAME: $ddd_param parameter is not a block device" >&2
-					return 1
-				fi
-				if [ ! -w "$ddd_param_value" ]; then
-					echo "$FUNCNAME: $ddd_param parameter value is not writable" >&2
-					return 1
-				fi
-				ddd_params[$ddd_param]="$ddd_param_value"
+				ddd_operands[$operand]="$operand_value"
 				;;
 			$DD_BS)
-				ddd_params[$ddd_param]="$(ddd_convertBS2B "$ddd_param_value")"
+				if [ ! -z "${ddd_operands[$DD_IBS]}" ]; then
+					echo "$FUNCNAME: $operand operand priority over $DD_IBS" >&2
+					unset ddd_operands[$DD_IBS]
+				fi
+				if [ ! -z "${ddd_operands[$DD_OBS]}" ]; then
+					echo "$FUNCNAME: $operand operand priority over $DD_OBS" >&2
+					unset ddd_operands[$DD_OBS]
+				fi
+				#convert block size with suffix to integer
+				ddd_operands[$operand]="$(ddd_convertBSS2Int "$operand_value")"
+				;;
+			$DD_IBS|$DD_OBS)
+				if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
+					echo "$FUNCNAME: $DD_BS operand priority over $operand" >&2
+				else
+					#convert block size with suffix to integer
+					ddd_operands[$operand]="$(ddd_convertBSS2Int "$operand_value")"
+				fi
 				;;
 			$DD_CNT)
-				if [ ! -z "${ddr_param_value//[0-9]}" ]; then
-					echo "$FUNCNAME: $ddd_param parameter is not a valid integer" >&2
+				if [ ! -z "${operand_value//[0-9]}" ]; then
+					echo "$FUNCNAME: $operand operand is not a valid integer" >&2
 					return 1
 				fi
-				ddd_params[$ddd_param]="${ddd_param_value##0*}"
+				#remove preceding zeros
+				ddd_operands[$operand]="${operand_value##0*}"
 				;;
 			$DD_STS)
-				case "$ddd_param_value" in
-					"none")
+				case "$operand_value" in
+					$DD_STS_NONE)
 						:
 						;;
-					"noxfer")
+					$DD_STS_NOXFER)
 						:
 						;;
-					"progress")
+					$DD_STS_PROGRESS)
 						:
 						;;
 					*)
-						echo "$FUNCNAME: $ddd_param parameter is not valid" >&2
+						echo "$FUNCNAME: $operand operand is not valid" >&2
 						return 1
 						;;
 				esac
-				ddd_params[$ddd_param]="$ddd_param_value"
+				ddd_operands[$operand]="$operand_value"
 				;;
 			$DD_SKIP)
-				if [ ! -z "$(echo "${ddd_param_value: -1}" | sed "s/[0-9B]//")" ]; then
-					echo "$FUNCNAME: $ddd_param parameter must be block size multiple or an byte offset" >&2
+				if [ ! -z "$(echo "${operand_value: -1}" | sed "s/[0-9B]//")" ]; then
+					echo "$FUNCNAME: $operand operand must be an integer representing a multliple of the block size or an byte offset" >&2
+					return 1
+				elif [ -z "$operand_value" ]; then
+					echo "$FUNCNAME: $operand value must not be empty" >&2
 					return 1
 				fi
-				ddd_params[$ddd_param]="$ddd_param_value"
+				ddd_operands[$operand]="$operand_value"
 				;;
 			$DD_SEEK)
-				if [ ! -z "$(echo "${ddd_param_value: -1}" | sed "s/[0-9B]//")" ]; then
-					echo "$FUNCNAME: $ddd_param parameter must be block size multiple or an byte offset" >&2
+				if [ ! -z "$(echo "${operand_value: -1}" | sed "s/[0-9B]//")" ]; then
+					echo "$FUNCNAME: $operand operand must be an integer representing a multiple of the block size or an byte offset" >&2
+					return 1
+				elif [ -z "$operand_value" ]; then
+					echo "$FUNCNAME: $operand value must not be empty" >&2
 					return 1
 				fi
-				ddd_params[$ddd_param]="$ddd_param_value"
+				ddd_operands[$operand]="$operand_value"
 				;;
 			*)
-				echo "$FUNCNAME: unrecognized parameter $ddd_param." >&2
+				echo "$FUNCNAME: unrecognized operand $operand." >&2
 				exit 1
 				;;
 		esac
 		shift
 	done
 
-	ddd_requiredParams
+	ddd_checkOperands
 
-	for ddd_param in "${!ddd_params[@]}"; do
-		if [ -z "${ddd_params[$ddd_param]}" ]; then
-			ddd_cmd+=" $ddd_param"
+	for operand in "${!ddd_operands[@]}"; do
+		if [ -z "${ddd_operands[$operand]}" ]; then
+			ddd_cmd+=" $operand"
+		elif [ "$operand" = $DD_BS ] || [ "$operand" = $DD_IBS ] || [ "$operand" = $DD_OBS ] ; then
+			ddd_cmd+=" $operand=$(ddd_convertInt2BSS ${ddd_operands[$operand]})"
 		else
-			ddd_cmd+=" $ddd_param=${ddd_params[$ddd_param]}"
+			ddd_cmd+=" $operand=${ddd_operands[$operand]}"
 		fi
 	done
 	echo $ddd_cmd
 
-	ddd_write
+	ddd_checkRead
+	ddd_checkWrite
+
+	ddd_startWrite
+	ddd_verifyWrite
 }
 
 ddd_main "$@"
