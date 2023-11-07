@@ -40,7 +40,9 @@ DDD_WRITE_SOFF="DDD_WRITE_SOFF" # start block offset
 DDD_WRITE_EBLK="DDD_WRITE_EBLK" # end block number based on write_bs
 DDD_WRITE_EOFF="DDD_WRITE_EOFF" # end block offset
 
-DDD_WRITE_BS_DEFAULT_SHIFT=20 # number of bits to shift to get write block size, 20 is 1MB
+if [ -z "$DDD_WRITE_BS_DEFAULT_SHIFT" ]; then
+	DDD_WRITE_BS_DEFAULT_SHIFT=22 # number of bits to shift to get write block size, 20 is 1MB, 21 is 2MB, 22 is 4MB
+fi
 
 # command line parameters
 declare -A ddd_operands=()
@@ -48,6 +50,7 @@ declare -A ddd_operands=()
 # internal state parameters
 declare -A ddd_internal=(
 	[$DDD_INPUT_BS]=512 #assumed device sector size, TODO add sector size detection
+	[$DDD_OUTPUT_BS]=512 #assumed device sector size, TODO add sector size detection
 	[$DDD_WRITE_BS]=$((1 << $DDD_WRITE_BS_DEFAULT_SHIFT))
 	[$DDD_WRITE_RETRY_CNT]=3
 	[$DDD_CMP_CNT]=16
@@ -57,11 +60,17 @@ ddd_cmd="dd"
 
 ddd_dump(){
 	for key in ${!ddd_operands[@]}; do
-		echo "$key: ${ddd_operands[$key]}"
+		echo "$key: ${ddd_operands[$key]}" >&2
 	done
 	if [ ! -z "$1" ]; then
 		for key in ${!ddd_internal[@]}; do
-			echo "$key: ${ddd_internal[$key]}"
+			local value=${ddd_internal[$key]}
+			local value_unit=$(ddd_convertInt2BSS ${ddd_internal[$key]})
+			if [ "$value" = "$value_unit" ]; then
+				echo "$key:	$value" >&2
+			else
+				echo "$key:	$value (${value_unit})" >&2
+			fi
 		done
 	fi
 }
@@ -141,20 +150,22 @@ ddd_checkRead(){
 
 # set obs based on bs or obs operand
 ddd_setInternalOutputBS(){
+	local ddd_write_bs=${ddd_internal[$DDD_WRITE_BS]}
 	if [ ! -z "${ddd_operands[$DD_BS]}" ]; then
 		local ddd_output_bs=${ddd_operands[$DD_BS]}
 	elif [ ! -z "${ddd_operands[$DD_OBS]}" ]; then
 		local ddd_output_bs=${ddd_operands[$DD_OBS]}
 	fi
-	local ddd_write_bs=${ddd_internal[$DDD_WRITE_BS]}
-	if [ $ddd_output_bs -gt $ddd_write_bs ]; then
-		if [ $(($ddd_output_bs % $ddd_write_bs)) -ne 0 ]; then
-			echo "$FUNCNAME: output block size must be a multiple of 2."
-			return 1
+	if [ ! -z "$ddd_output_bs" ]; then
+		if [ $ddd_output_bs -gt $ddd_write_bs ]; then
+			if [ $(($ddd_output_bs % $ddd_write_bs)) -ne 0 ]; then
+				echo "$FUNCNAME: output block size must be a multiple of 2."
+				return 1
+			fi
+			ddd_internal[$DDD_WRITE_BS]=$ddd_output_bs
 		fi
-		ddd_internal[$DDD_WRITE_BS]=$ddd_output_bs
+		ddd_internal[$DDD_OUTPUT_BS]=$ddd_output_bs
 	fi
-	ddd_internal[$DDD_OUTPUT_BS]=$ddd_output_bs
 }
 
 # check of operands and set internal parameters
@@ -345,14 +356,22 @@ ddd_syncBlock(){
 	#set -x
 	if cmp -s -n $ddd_obs	<(dd if="$ddd_if" ibs=$ddd_ibs skip=$1 count=$2 status=none) \
 				<(dd if="$ddd_of" ibs=$ddd_obs skip=$3 count=1 status=none iflag=nocache); then
+		ddd_blocks_skip=$((++ddd_blocks_skip))
+		echo -n "SKIP"
 		return
 	fi
+	ddd_blocks_sync=$((++ddd_blocks_sync))
+	echo -n "SYNC"
 	if ! dd if="$ddd_if" ibs=$ddd_ibs skip=$1 count=$2 of="$ddd_of" obs=$ddd_obs seek=$3 status=none oflag=sync conv=notrunc; then
+		ddd_blocks_sync_fail=$((++ddd_blocks_sync_fail))
+		echo "SYNC FAIL"
 		echo "$FUNCNAME: failed write at write block $ddd_block" >&2
 		return 2
 	fi
 	if ! cmp -s -n $ddd_obs	<(dd if="$ddd_if" ibs=$ddd_ibs skip=$1 count=$2 status=none) \
 				<(dd if="$ddd_of" ibs=$ddd_obs skip=$3 count=1 status=none iflag=nocache); then
+		ddd_blocks_cmp1_fail=$((++ddd_blocks_cmp1_fail))
+		echo "CMP FAIL"
 		echo "$FUNCNAME: mismatch at block $ddd_block" >&2
 		return 1
 	fi
@@ -364,15 +383,22 @@ ddd_syncPartialBlock(){
 	#set -x
 	if cmp -s -n $ddd_bs_single	<(dd if="$ddd_if" ibs=$ddd_bs_single skip=$1 count=1 status=none) \
 					<(dd if="$ddd_of" ibs=$ddd_bs_single skip=$2 count=1 status=none iflag=nocache); then
-		#echo "dd if=$ddd_if ibs=$ddd_bs_single skip=$1 count=1 of=$ddd_of obs=$ddd_bs_single seek=$2 status=none oflag=sync conv=notrunc"
+		ddd_blocks_skip=$((++ddd_blocks_skip))
+		echo -n "SKIP"
 		return
 	fi
+	ddd_blocks_sync=$((++ddd_blocks_sync))
+	echo -n "SYNC"
 	if ! dd if="$ddd_if" ibs=$ddd_bs_single skip=$1 count=1 of="$ddd_of" obs=$ddd_bs_single seek=$2 status=none oflag=sync conv=notrunc; then
+		ddd_blocks_sync_fail=$((++ddd_blocks_sync_fail))
+		echo "SYNC FAIL"
 		echo "$FUNCNAME: failed write at write block $ddd_block" >&2
 		return 2
 	fi
 	if ! cmp -s -n $ddd_bs_single	<(dd if="$ddd_if" ibs=$ddd_bs_single skip=$1 count=1 status=none) \
 					<(dd if="$ddd_of" ibs=$ddd_bs_single skip=$2 count=1 status=none iflag=nocache); then
+		ddd_blocks_cmp1_fail=$((++ddd_blocks_cmp1_fail))
+		echo "CMP FAIL"
 		echo "$FUNCNAME: mismatch at block $ddd_block" >&2
 		return 1
 	fi
@@ -400,10 +426,15 @@ ddd_sync(){
 	ddd_block=0
 	ddd_blocks=$((ddd_write_eblk - ddd_write_sblk + 1))
 
-	set -x
+	ddd_blocks_skip=0
+	ddd_blocks_sync=0
+	ddd_blocks_sync_fail=0
+	ddd_blocks_cmp1_fail=0
+
+	#set -x
 	for i in $(seq $ddd_write_sblk $ddd_write_eblk); do
 		ddd_block=$((ddd_block + 1))
-		#echo -en "\rddd: syncing $ddd_block of $ddd_blocks: "
+		echo -en "\rddd: block $ddd_block of $ddd_blocks: "
 		if [ $i -ne $ddd_write_sblk ] && [ $i -ne $ddd_write_eblk ]; then
 			local skip=$((ddd_read_start + ddd_bs_single + (i - ddd_write_sblk - 1) * ddd_obs))
 			local count=$((ddd_obs / ddd_ibs))
@@ -429,12 +460,12 @@ ddd_sync(){
 			ddd_syncPartialBlock ${skip}B ${seek}B
 		fi
 	done
-	set +x
-	echo -en '\r'
+	#set +x
+	echo -e "\rSKIP: $ddd_blocks_skip SYNC: $ddd_blocks_sync SYNC_FAIL: $ddd_blocks_sync_fail CMP1_FAIL: $ddd_blocks_cmp1_fail"
 }
 
 ddd_verify(){
-	:
+	cmp -s -n "${ddd_internal[$DDD_READ_SIZE]}" <() <()
 }
 
 ddd_debug(){
@@ -578,11 +609,11 @@ ddd_main(){
 
 	ddd_dump 1
 	
-	set -x
+	#set -x
 	if [ ! -e "${ddd_operands[$DD_OF]}" ]; then
-		$ddd_cmd conv=sparse
+		$ddd_cmd conv=sparse status=progress
 	fi
-	set +x
+	#set +x
 	
 	ddd_sync
 
